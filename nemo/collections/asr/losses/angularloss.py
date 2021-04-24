@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import torch
+import torch.nn.functional as F
 
 from nemo.core.classes import Loss, Typing, typecheck
 from nemo.core.neural_types import LabelsType, LogitsType, LossType, NeuralType
@@ -47,22 +50,40 @@ class AngularSoftmaxLoss(Loss, Typing):
         """
         return {"loss": NeuralType(elements_type=LossType())}
 
-    def __init__(self, scale=20.0, margin=1.35):
+    def __init__(self, scale=30, margin=0.2):
         super().__init__()
 
         self.eps = 1e-7
         self.scale = scale
         self.margin = margin
+        self.cos_m = math.cos(self.margin)
+        self.sin_m = math.sin(self.margin)
+        self.th = math.cos(math.pi - self.margin)
+        self.mm = math.sin(math.pi - self.margin) * self.margin
+        self.criterion = torch.nn.KLDivLoss(reduction="sum")
+
+    # @typecheck()
+    # def forward(self, logits, labels):
+    #     numerator = self.scale * torch.cos(
+    #         torch.acos(torch.clamp(torch.diagonal(logits.transpose(0, 1)[labels]), -1.0 + self.eps, 1 - self.eps))
+    #         + self.margin
+    #     )
+    #     excl = torch.cat(
+    #         [torch.cat((logits[i, :y], logits[i, y + 1 :])).unsqueeze(0) for i, y in enumerate(labels)], dim=0
+    #     )
+    #     denominator = torch.exp(numerator) + torch.sum(torch.exp(self.scale * excl), dim=1)
+    #     L = numerator - torch.log(denominator)
+    #     return -torch.mean(L)
 
     @typecheck()
     def forward(self, logits, labels):
-        numerator = self.scale * torch.cos(
-            torch.acos(torch.clamp(torch.diagonal(logits.transpose(0, 1)[labels]), -1.0 + self.eps, 1 - self.eps))
-            + self.margin
-        )
-        excl = torch.cat(
-            [torch.cat((logits[i, :y], logits[i, y + 1 :])).unsqueeze(0) for i, y in enumerate(labels)], dim=0
-        )
-        denominator = torch.exp(numerator) + torch.sum(torch.exp(self.scale * excl), dim=1)
-        L = numerator - torch.log(denominator)
-        return -torch.mean(L)
+        labels = F.one_hot(labels.long(), logits.shape[1]).float()
+        cosine = logits.float()
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+        phi = cosine * self.cos_m - sine * self.sin_m  # cos(theta + m)
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        outputs = (labels * phi) + ((1.0 - labels) * cosine)
+        predictions = self.scale * outputs
+        predictions = F.log_softmax(predictions, dim=1)
+        loss = self.criterion(predictions, labels) / labels.sum()
+        return loss
